@@ -7,10 +7,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY wm.py .
+COPY scripts/watermark.py .
 
 RUN useradd --create-home app
 USER app
 
 WORKDIR /data
-ENTRYPOINT ["python", "/app/wm.py"]
+ENTRYPOINT ["python", "/app/watermark.py"]

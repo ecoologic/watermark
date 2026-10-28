@@ -1,4 +1,4 @@
 .git
-*.jpg
-*.pdf
+input
+output
 config.json

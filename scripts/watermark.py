@@ -3,10 +3,14 @@
 import argparse
 import json
 import math
+import re
 import sys
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -16,6 +20,14 @@ FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 JPEG_QUALITY = 85
 TILE_ANGLE = 30
 TEXT_GREY = 128
+EXIF_DATE_TIME = 0x0132
+XMP_TEMPLATE = (
+    '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+    'xmp:ModifyDate="{date}"><dc:description><rdf:Alt><rdf:li xml:lang="x-default">{text}</rdf:li></rdf:Alt>'
+    '</dc:description></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+)
 
 
 class ConfigError(Exception):
@@ -29,7 +41,6 @@ def _is_number(value: object) -> bool:
 @dataclass(frozen=True)
 class Config:
     size: int  # maximum long edge, in pixels
-    watermark: str | None
     opacity: float = 0.15
     font_size: float = 0.04  # fraction of the image long edge
 
@@ -46,10 +57,6 @@ class Config:
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise ConfigError("'size' must be a positive integer")
 
-        watermark = raw.get("watermark")
-        if watermark is not None and not (isinstance(watermark, str) and watermark.strip()):
-            raise ConfigError("'watermark' must be a non-empty string")
-
         opacity = raw.get("opacity", cls.opacity)
         if not _is_number(opacity) or not 0 < opacity <= 1:
             raise ConfigError("'opacity' must be a number above 0 and up to 1")
@@ -58,7 +65,7 @@ class Config:
         if not _is_number(font_size) or not 0 < font_size <= 1:
             raise ConfigError("'font_size' must be a number above 0 and up to 1")
 
-        return cls(size, watermark, opacity, font_size)
+        return cls(size, opacity, font_size)
 
 
 def fit(image: Image.Image, size: int) -> Image.Image:
@@ -67,8 +74,30 @@ def fit(image: Image.Image, size: int) -> Image.Image:
     return image
 
 
-def save_jpeg(image: Image.Image, path: Path) -> None:
-    image.convert("RGB").save(path, "JPEG", quality=JPEG_QUALITY)
+def save_jpeg(image: Image.Image, path: Path, **metadata: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.convert("RGB").save(path, "JPEG", quality=JPEG_QUALITY, **metadata)
+
+
+def watermark_metadata(text: str, when: datetime) -> dict[str, bytes]:
+    """EXIF holds the date. XMP holds the date and the exact text, which EXIF cannot store in Unicode."""
+    exif = Image.Exif()
+    exif[EXIF_DATE_TIME] = when.strftime("%Y:%m:%d %H:%M:%S")
+    xmp = XMP_TEMPLATE.format(text=escape(text), date=when.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return {"exif": exif.tobytes(), "xmp": xmp.encode()}
+
+
+def normalise(text: str) -> str:
+    """Lowercase ASCII words joined by single dashes: 'Café – 2026' -> 'cafe-2026'."""
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")
+
+
+def output_path(source: Path, output_dir: Path | None, watermark: str | None = None, page: int | None = None) -> Path:
+    """`<stem>-<watermark>-<extension>[-<page>].jpg`, in `output_dir` or next to `source`."""
+    parts = [normalise(source.stem), watermark and normalise(watermark), normalise(source.suffix), page]
+    name = "-".join(str(part) for part in parts if part)
+    return (output_dir or source.parent) / f"{name}.jpg"
 
 
 def load_image(path: Path) -> Image.Image:
@@ -76,25 +105,25 @@ def load_image(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(image)
 
 
-def render_pdf(path: Path, size: int) -> Iterator[Image.Image]:
+def render_pdf(path: Path, size: int) -> Iterator[tuple[int | None, Image.Image]]:
+    """Yield `(page number, image)`. The number is None for a one-page PDF."""
     pdf = pdfium.PdfDocument(path)
     try:
-        for page in pdf:
+        for number, page in enumerate(pdf, start=1):
             width, height = page.get_size()
             bitmap = page.render(scale=size / max(width, height))
             # Rounding can add one pixel: fit() trims it.
-            yield fit(bitmap.to_pil(), size)
+            yield (number if len(pdf) > 1 else None), fit(bitmap.to_pil(), size)
     finally:
         pdf.close()
 
 
-def pdf_to_jpgs(source: Path, size: int) -> list[Path]:
-    targets = []
-    for number, page in enumerate(render_pdf(source, size), start=1):
-        target = source.with_name(f"{source.stem}-{number}.jpg")
-        save_jpeg(page, target)
-        targets.append(target)
-    return targets
+def pages(source: Path, size: int) -> Iterator[tuple[int | None, Image.Image]]:
+    """The pages of a PDF, or the single image of any other file."""
+    if source.suffix.lower() == ".pdf":
+        yield from render_pdf(source, size)
+    else:
+        yield None, fit(load_image(source), size)
 
 
 def tile_layer(text: str, extent: int, font: ImageFont.FreeTypeFont, alpha: int) -> Image.Image:
@@ -128,33 +157,43 @@ def apply_watermark(image: Image.Image, text: str, opacity: float, font_ratio: f
 
 
 def cmd_pdf2jpg(args: argparse.Namespace, config: Config) -> None:
-    for target in pdf_to_jpgs(args.path, config.size):
+    for page, image in render_pdf(args.path, config.size):
+        target = output_path(args.path, args.output, page=page)
+        save_jpeg(image, target)
         print(target)
 
 
 def cmd_watermark(args: argparse.Namespace, config: Config) -> None:
-    if config.watermark is None:
-        raise ConfigError("'watermark' is missing")
-    image = fit(load_image(args.path), config.size)
-    marked = apply_watermark(image, config.watermark, config.opacity, config.font_size)
-    target = args.path.with_name(f"{args.path.stem}-wm.jpg")
-    save_jpeg(marked, target)
-    print(target)
+    metadata = watermark_metadata(args.watermark, datetime.now(timezone.utc))
+    for page, image in pages(args.path, config.size):
+        marked = apply_watermark(image, args.watermark, config.opacity, config.font_size)
+        target = output_path(args.path, args.output, args.watermark, page)
+        save_jpeg(marked, target, **metadata)
+        print(target)
+
+
+def watermark_text(value: str) -> str:
+    if not normalise(value):
+        raise argparse.ArgumentTypeError("needs at least one letter or digit")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("path", type=Path, help="input file")
     common.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="config file (default: %(default)s)")
+    common.add_argument("--output", type=Path, help="output folder (default: next to the input file)")
 
-    parser = argparse.ArgumentParser(prog="wm", description=__doc__)
+    parser = argparse.ArgumentParser(prog="watermark", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser(
         "pdf2jpg", parents=[common], help="PDF to one resized JPG per page"
     ).set_defaults(run=cmd_pdf2jpg)
-    commands.add_parser(
-        "watermark", parents=[common], help="image to one resized, watermarked JPG"
-    ).set_defaults(run=cmd_watermark)
+    mark = commands.add_parser(
+        "watermark", parents=[common], help="PDF or image to resized, watermarked JPGs"
+    )
+    mark.add_argument("--watermark", type=watermark_text, required=True, help="the watermark text")
+    mark.set_defaults(run=cmd_watermark)
     return parser
 
 
